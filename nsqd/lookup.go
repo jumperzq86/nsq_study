@@ -75,6 +75,10 @@ func connectCallback(n *NSQD, hostname string) func(*lookupPeer) {
 	}
 }
 
+//note: lookupLoop 执行如下几个功能
+//	根据配置数据连接所有lookupd server，发送心跳消息
+//	当配置发生变化时，重新连接/断开 lookupd server
+//	接收底层topic/channel消息，向lookupd server注册/注销 topic/channel
 func (n *NSQD) lookupLoop() {
 	var lookupPeers []*lookupPeer
 	var lookupAddrs []string
@@ -89,6 +93,7 @@ func (n *NSQD) lookupLoop() {
 	// for announcements, lookupd determines the host automatically
 	ticker := time.Tick(15 * time.Second)
 	for {
+		//note: 依据配置数据连接所有的nsqlookupd
 		if connect {
 			for _, host := range n.getOpts().NSQLookupdTCPAddresses {
 				if in(host, lookupAddrs) {
@@ -107,6 +112,7 @@ func (n *NSQD) lookupLoop() {
 
 		select {
 		case <-ticker:
+			//note: 发送心跳到所有lookupd
 			// send a heartbeat and read a response (read detects closed conns)
 			for _, lookupPeer := range lookupPeers {
 				n.logf(LOG_DEBUG, "LOOKUPD(%s): sending heartbeat", lookupPeer)
@@ -117,6 +123,7 @@ func (n *NSQD) lookupLoop() {
 				}
 			}
 		case val := <-n.notifyChan:
+			//note: 接收底层来自topic/channel的消息，构造注册和注销命令，发送给所有lookupd
 			var cmd *nsq.Command
 			var branch string
 
@@ -149,6 +156,8 @@ func (n *NSQD) lookupLoop() {
 				}
 			}
 		case <-n.optsNotificationChan:
+			//note: 当更新了配置文件，比如lookupd server地址，就会通过http接口 调用httpServer.doConfig 来走到如下逻辑
+			//	重新更新lookupPeers
 			var tmpPeers []*lookupPeer
 			var tmpAddrs []string
 			for _, lp := range lookupPeers {

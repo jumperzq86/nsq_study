@@ -16,6 +16,7 @@ import (
 	"time"
 )
 
+//exercise: slowflake - noeqd
 const (
 	nodeIDBits     = uint64(10)
 	sequenceBits   = uint64(12)

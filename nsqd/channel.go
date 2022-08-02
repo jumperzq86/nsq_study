@@ -34,6 +34,8 @@ type Consumer interface {
 //
 // Channels maintain all client and message metadata, orchestrating in-flight
 // messages, timeouts, requeuing, etc.
+
+//todo: 提炼Channel
 type Channel struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	requeueCount uint64
@@ -50,7 +52,9 @@ type Channel struct {
 
 	memoryMsgChan chan *Message
 	exitFlag      int32
-	exitMutex     sync.RWMutex
+	//note: exitMutex 用于保护退出流程，而非保护某个数据结构
+	//	因此只有在 exit函数中为写锁，其他位置均为读锁
+	exitMutex sync.RWMutex
 
 	// state tracking
 	clients        map[int64]Consumer
@@ -126,11 +130,18 @@ func NewChannel(topicName string, channelName string, nsqd *NSQD,
 func (c *Channel) initPQ() {
 	pqSize := int(math.Max(1, float64(c.nsqd.getOpts().MemQueueSize)/10))
 
+	//note: inFlightMessages / deferredMessages 两个消息的超时检测逻辑在 nsqd.queueScanLoop 函数中
+
+	//note: inFlightMessages/inFlightPQ 用于保存和排序空中消息
 	c.inFlightMutex.Lock()
 	c.inFlightMessages = make(map[MessageID]*Message)
 	c.inFlightPQ = newInFlightPqueue(pqSize)
 	c.inFlightMutex.Unlock()
 
+	//note: deferredMessages/deferredPQ 用途
+	//	deferedMessages 是用来存放延迟消息的
+	// 	延迟发送为消息的一个功能
+	// 	逻辑查看 Channel.PutMessageDeferred 的函数调用链
 	c.deferredMutex.Lock()
 	c.deferredMessages = make(map[MessageID]*pqueue.Item)
 	c.deferredPQ = pqueue.New(pqSize)
@@ -152,10 +163,17 @@ func (c *Channel) Close() error {
 	return c.exit(false)
 }
 
+//note: 关闭 / 删除 Channel 的区别
+//	两者都会关闭当前消费者连接
+//	关闭：不会在 lookupd 中注销该channel，会将当前所有未完成流程的消息写入磁盘保存
+//	删除：会在 lookupd 中注销该channel，不会将当前所有未完成流程的消息写入磁盘保存
+// 	两者都是在 Topic.exit 中被调用的，简单说就是 delete 不在乎消息丢失，因此不再进行消息的串行化
+
 func (c *Channel) exit(deleted bool) error {
 	c.exitMutex.Lock()
 	defer c.exitMutex.Unlock()
 
+	//note: Channel.exitFlag 在多处使用，某些地方是没有使用 exitMutex 的，因此需要使用原子操作
 	if !atomic.CompareAndSwapInt32(&c.exitFlag, 0, 1) {
 		return errors.New("exiting")
 	}
@@ -165,18 +183,22 @@ func (c *Channel) exit(deleted bool) error {
 
 		// since we are explicitly deleting a channel (not just at system exit time)
 		// de-register this from the lookupd
+		//note: 删除channel，通知lookupd注销该channel
 		c.nsqd.Notify(c, !c.ephemeral)
 	} else {
 		c.nsqd.logf(LOG_INFO, "CHANNEL(%s): closing", c.name)
 	}
 
 	// this forceably closes client connections
+	//note: 关闭消费者连接
 	c.RLock()
 	for _, client := range c.clients {
 		client.Close()
 	}
 	c.RUnlock()
 
+	//note: 删除channel，就先使用c.Empty将 c.memoryMsgChan， c.inFlightMessages， c.deferredMessages 三处消息释放掉
+	//	防止后面调用 c.flush 写入disk
 	if deleted {
 		// empty the queue (deletes the backend files, too)
 		c.Empty()
@@ -188,6 +210,7 @@ func (c *Channel) exit(deleted bool) error {
 	return c.backend.Close()
 }
 
+//note: exit-del 中调用，清空三个队列，清空消费者，清空磁盘备份
 func (c *Channel) Empty() error {
 	c.Lock()
 	defer c.Unlock()
@@ -197,6 +220,7 @@ func (c *Channel) Empty() error {
 		client.Empty()
 	}
 
+	//note: 将来自topic的消息释放掉
 	for {
 		select {
 		case <-c.memoryMsgChan:
@@ -206,6 +230,7 @@ func (c *Channel) Empty() error {
 	}
 
 finish:
+	//note: 将第二级存储（磁盘）上的消息释放掉
 	return c.backend.Empty()
 }
 
@@ -271,6 +296,7 @@ func (c *Channel) doPause(pause bool) error {
 		atomic.StoreInt32(&c.paused, 0)
 	}
 
+	//note: 暂停Channel 实质就是暂停 Consumer
 	c.RLock()
 	for _, client := range c.clients {
 		if pause {
@@ -302,8 +328,11 @@ func (c *Channel) PutMessage(m *Message) error {
 	return nil
 }
 
+//note: 此处发现无法放入内存队列，就会将消息放到磁盘中
+//	也许下一个消息就直接送到内存队列中了，这便是无法保证消息顺序的一个原因
 func (c *Channel) put(m *Message) error {
 	select {
+	//note: 放入channel.memoryMsgChan中的消息，会在 protocolV2.messagePump 函数中获取并且真正发送给客户端
 	case c.memoryMsgChan <- m:
 	default:
 		err := writeMessageToBackend(m, c.backend)
@@ -321,6 +350,20 @@ func (c *Channel) PutMessageDeferred(msg *Message, timeout time.Duration) {
 	atomic.AddUint64(&c.messageCount, 1)
 	c.StartDeferredTimeout(msg, timeout)
 }
+
+//question: 一条消息发出之后未发生超时和发生超时两种情况下到逻辑是什么样到
+
+//note: Channel.TouchMessage 接收到客户端 TOUCH 消息时调用
+//	当消费者接收到nsqd的消息时，有两种处理消息的方式
+//	同步处理，即 接收到消息-处理消息-回复FIN 在一个流程中完成
+//	异步处理，即 接收到消息 | 处理消息-回复FIN 在不同流程中处理
+//	若是采用异步处理，那么可能在nsqd消息都已经超时了，在消费者中还未开始处理消息
+//	对于这种情况，就需要延长消息都超时时间，而TOUCH消息就是干这个事情的
+//	在接收到消息之后，考虑适时发送TOUCH消息以便延长消息超时时间
+//	另外需要注意两个配置
+//	--msg-timeout is the default message timeout for consumers which do not specify one
+//	--max-msg-timeout is the longest message timeout which consumers are allowed to request
+//	来自 https://github.com/nsqio/go-nsq/issues/266
 
 // TouchMessage resets the timeout for an in-flight message
 func (c *Channel) TouchMessage(clientID int64, id MessageID, clientMsgTimeout time.Duration) error {
@@ -347,6 +390,7 @@ func (c *Channel) TouchMessage(clientID int64, id MessageID, clientMsgTimeout ti
 }
 
 // FinishMessage successfully discards an in-flight message
+//note: 接收到客户端 FIN 消息时调用
 func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
 	msg, err := c.popInFlightMessage(clientID, id)
 	if err != nil {
@@ -365,6 +409,10 @@ func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
 // `timeoutMs`  > 0 - asynchronously wait for the specified timeout
 //     and requeue a message (aka "deferred requeue")
 //
+//note: 接收到客户端 REQ 消息时调用
+//	无延时 Channel.put 放到内存队列或者磁盘上
+//	有延时 放到 deferred 队列中去
+
 func (c *Channel) RequeueMessage(clientID int64, id MessageID, timeout time.Duration) error {
 	// remove from inflight first
 	msg, err := c.popInFlightMessage(clientID, id)
@@ -398,6 +446,7 @@ func (c *Channel) AddClient(clientID int64, client Consumer) error {
 		return errors.New("exiting")
 	}
 
+	//note: 出于性能考虑，先使用读锁，有必要再使用写锁
 	c.RLock()
 	_, ok := c.clients[clientID]
 	numClients := len(c.clients)
@@ -443,6 +492,7 @@ func (c *Channel) RemoveClient(clientID int64) {
 	}
 }
 
+//note: 发送消息之前，将其保存到 in flight 队列中
 func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {
 	now := time.Now()
 	msg.clientID = clientID
@@ -456,6 +506,7 @@ func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout tim
 	return nil
 }
 
+//note: 对于延迟消息，欲发送之前或者接收到REQ（重排）之后，将其保存到 deferred 队列中
 func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) error {
 	absTs := time.Now().Add(timeout).UnixNano()
 	item := &pqueue.Item{Value: msg, Priority: absTs}
@@ -547,6 +598,7 @@ func (c *Channel) addToDeferredPQ(item *pqueue.Item) {
 	c.deferredMutex.Unlock()
 }
 
+//note: processDeferredQueue 将 deferred 队列中所有超时的消息取出放到内存队列/磁盘中，入参t为当前时间
 func (c *Channel) processDeferredQueue(t int64) bool {
 	c.exitMutex.RLock()
 	defer c.exitMutex.RUnlock()
@@ -578,6 +630,7 @@ exit:
 	return dirty
 }
 
+//note: processInFlightQueue 将 inflight 队列中所有超时的消息取出放到内存队列/磁盘中，入参t为当前时间
 func (c *Channel) processInFlightQueue(t int64) bool {
 	c.exitMutex.RLock()
 	defer c.exitMutex.RUnlock()

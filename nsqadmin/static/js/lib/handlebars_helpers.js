@@ -155,7 +155,7 @@ Handlebars.registerHelper('for', function(from, to, incr, block) {
 //       Step is unlocked or finished!
 //     {{/if}}
 //
-// Any number of arguments may be given to either helper. NOTE: _.initial() is
+// Any number of arguments may be given to either helper. hereNOTE: _.initial() is
 // used below because every helper takes an options hash as its last argument.
 Handlebars.registerHelper('and', function() {
     return _.all(_.initial(arguments));

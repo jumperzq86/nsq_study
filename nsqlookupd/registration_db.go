@@ -97,7 +97,7 @@ func (r *RegistrationDB) RemoveProducer(k Registration, id string) (bool, int) {
 		removed = true
 	}
 
-	// Note: this leaves keys in the DB even if they have empty lists
+	// hereNote: this leaves keys in the DB even if they have empty lists
 	delete(producers, id)
 	return removed, len(producers)
 }

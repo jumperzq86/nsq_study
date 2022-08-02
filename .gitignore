@@ -52,3 +52,5 @@ _testmain.go
 
 # vim stuff
 *.sw[op]
+
+.idea/

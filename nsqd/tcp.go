@@ -23,6 +23,8 @@ type tcpServer struct {
 	conns sync.Map
 }
 
+//note: tpc服务端接收到连接请求，创建协程调用Handle来单独处理该连接到所有业务逻辑
+//	Handle 函数中，由conn创建client，然后调用IOLoop来启动所有逻辑流程，并阻塞住
 func (p *tcpServer) Handle(conn net.Conn) {
 	p.nsqd.logf(LOG_INFO, "TCP: new client(%s)", conn.RemoteAddr())
 

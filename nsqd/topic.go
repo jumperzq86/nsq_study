@@ -277,6 +277,7 @@ func (t *Topic) messagePump() {
 	// main message loop
 	for {
 		select {
+		//note: 从topic内存队列/磁盘获取消息，准备后面发送用
 		case msg = <-memoryMsgChan:
 		case buf = <-backendChan:
 			msg, err = decodeMessage(buf)
@@ -285,6 +286,7 @@ func (t *Topic) messagePump() {
 				continue
 			}
 		case <-t.channelUpdateChan:
+			//note: channel 变化，重新更新chans
 			chans = chans[:0]
 			t.RLock()
 			for _, c := range t.channelMap {
@@ -300,6 +302,7 @@ func (t *Topic) messagePump() {
 			}
 			continue
 		case <-t.pauseChan:
+			//note: channel 暂停，检查是否所有channel都暂停
 			if len(chans) == 0 || t.IsPaused() {
 				memoryMsgChan = nil
 				backendChan = nil
@@ -323,10 +326,12 @@ func (t *Topic) messagePump() {
 				chanMsg.Timestamp = msg.Timestamp
 				chanMsg.deferred = msg.deferred
 			}
+			//note: 对于延迟消息，放入channel延迟队列
 			if chanMsg.deferred != 0 {
 				channel.PutMessageDeferred(chanMsg, chanMsg.deferred)
 				continue
 			}
+			//note: 对于普通消息，放入channel内存队列
 			err := channel.PutMessage(chanMsg)
 			if err != nil {
 				t.nsqd.logf(LOG_ERROR,

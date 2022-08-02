@@ -38,6 +38,9 @@ func (p *protocolV2) NewClient(conn net.Conn) protocol.Client {
 	return newClientV2(clientID, conn, p.nsqd)
 }
 
+//note: IOLoop 主要具有两个功能
+// 1. 通过tcp连接接收来自客户端的消息，包括发布者和订阅者，然后调用 Exec 函数进入消息处理逻辑
+// 2. 在协程函数 messagePump 中，通过消息通道 memoryMsgChan / backendMsgChan 接收来自底层的消息，然后转发给订阅者
 func (p *protocolV2) IOLoop(c protocol.Client) error {
 	var err error
 	var line []byte
@@ -54,6 +57,7 @@ func (p *protocolV2) IOLoop(c protocol.Client) error {
 	go p.messagePump(client, messagePumpStartedChan)
 	<-messagePumpStartedChan
 
+	//note: 以下为接收处理客户端消息逻辑，处理逻辑通过调用 protocolV2.Exec 来实现
 	for {
 		if client.HeartbeatInterval > 0 {
 			client.SetReadDeadline(time.Now().Add(client.HeartbeatInterval * 2))
@@ -207,7 +211,7 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	var memoryMsgChan chan *Message
 	var backendMsgChan <-chan []byte
 	var subChannel *Channel
-	// NOTE: `flusherChan` is used to bound message latency for
+	// hereNote: `flusherChan` is used to bound message latency for
 	// the pathological case of a channel on a low volume topic
 	// with >1 clients having >1 RDY counts
 	var flusherChan <-chan time.Time
@@ -227,12 +231,28 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	//       (ie. we would block in this loop anyway)
 	//
 	flushed := true
+	//note: 函数中可以看到当从 backendMsgChan / memoryMsgChan 中获取到数据调用 write 之后，会将 flushed = false
+	// 从而会 flusherChan = outputBufferTicker.C 启动 select 中的 case <-flusherChan
+	// 该case中 会调用 flush 从而完成真正发送出数据
+	// 这里有可能在进入 case <-flusherChan 之前 多次进入了 case msg := <-memoryMsgChan / case b := <-backendMsgChan
+	// 因此起到了一次 flush 发送多条数据的作用
+	// select case 选择是随机的，因此这里的注释提到 opportunistically
+	// 在 protocolV2.Send 中可以看到对于非 frameTypeMessage 类型，是直接flush的，以免延误
+
+	//note: 另外这里看到 select case a: 的一种使用技巧，可以随时按照需要将 a = nil / a = xxx 来关闭/打开 case 分支
 
 	// signal to the goroutine that started the messagePump
 	// that we've started up
 	close(startedChan)
 
 	for {
+		//note: 当完成 client 与 Topic.Channel 关联之后，就会走 else if / else 分支
+		//	从select下 memoryMsgChan / backendMsgChan 获取需要发送当消息，然后发送， 赋值flushed = false
+		//	之后这里会走到 else 赋值 flusherChan = outputBufferTicker.C，从而打开 select 下 case <-flusherChan: 分支
+		//	让其有机会执行 client.Flush() 将多次数据一次发送
+
+		//note: IsReadyForMessages 函数中会对比client当前的
+		//	c.InFlightCount 和 c.ReadyCount 从而确定客户端是否准备好接收新的消息
 		if subChannel == nil || !client.IsReadyForMessages() {
 			// the client is not ready to receive messages...
 			memoryMsgChan = nil
@@ -274,9 +294,18 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 			flushed = true
 		case <-client.ReadyStateChan:
 		case subChannel = <-subEventChan:
+			//note: 消费者会首先发送"SUB"即订阅消息，在protocol.SUB 中处理该消息，那里会将指定channel与该client关联起来即相互保存
+			//	然后会将channel传入 client.SubEventChan
+			//	由此在下面 case subChannel = <-subEventChan: 中赋值为 subChannel
+			//	即subChannel即为该client监听的Topic.Channel
+			//	分支下的 subEventChan = nil 即让该分支无法走到，即不能在监听其他通道
+
 			// you can't SUB anymore
 			subEventChan = nil
+
 		case identifyData := <-identifyEventChan:
+			//note: 接收到 IDENTIFY 命令之后，底层通过 client.IdentifyEventChan 通知此处改变某些特性
+
 			// you can't IDENTIFY anymore
 			identifyEventChan = nil
 
@@ -298,6 +327,16 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 
 			msgTimeout = identifyData.MsgTimeout
 		case <-heartbeatChan:
+			//note: nsqd 会周期发送 heartbeat 消息到客户端，期盼客户端在一定时限内回复一个命令或者NOP（空闲时），否则会关闭连接
+			// 具体参见 https://nsq.io/clients/tcp_protocol_spec.html
+			// The V2 protocol also features client heartbeats.
+			// Every 30s (default but configurable),
+			// nsqd will send a _heartbeat_ response and expect a command in return.
+			// If the client is idle, send NOP. After 2 unanswered _heartbeat_ responses,
+			// nsqd will timeout and forcefully close a client connection that it has not heard from.
+			// The IDENTIFY command may be used to change/disable this behavior.
+			// 见前面一个case
+
 			err = p.Send(client, frameTypeResponse, heartbeatBytes)
 			if err != nil {
 				goto exit
@@ -582,6 +621,8 @@ func (p *protocolV2) CheckAuth(client *clientV2, cmd, topicName, channelName str
 	return nil
 }
 
+//note: 订阅消息，核心就是将client 关联到topic-channel
+// 对于正在关闭到临时topic/channel 不会再加入
 func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 	if atomic.LoadInt32(&client.State) != stateInit {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot SUB in current state")
@@ -640,6 +681,11 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 	return okBytes, nil
 }
 
+//note: 接收到来自订阅者RDY消息，为流控逻辑的一部分
+//	该消息中可能带有count数据，即当前可以处理的消息数量
+//	client.SetReadyCount(count) 调用中会对比之前的值，若是发生变化，就会执行 c.ReadyStateChan <- 1: 通知 messagePump 函数
+//	messagePump 函数中会再次进入 for 循环开头的 !client.IsReadyForMessages() ，其中会对比client当前的
+//	c.InFlightCount 和 c.ReadyCount 从而确定客户端是否准备好接收新的消息
 func (p *protocolV2) RDY(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
 
@@ -703,6 +749,7 @@ func (p *protocolV2) FIN(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, nil
 }
 
+//note: 当客户端处理消息失败（不是接收超时），可以通过REQ来让nsqd将消息再次放入队列，即客户端能够在之后再次收到该消息，以便再次尝试处理
 func (p *protocolV2) REQ(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
 	if state != stateSubscribed && state != stateClosing {
@@ -750,6 +797,7 @@ func (p *protocolV2) REQ(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, nil
 }
 
+//note:  客户端进入关闭流程
 func (p *protocolV2) CLS(client *clientV2, params [][]byte) ([]byte, error) {
 	if atomic.LoadInt32(&client.State) != stateSubscribed {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot CLS in current state")
@@ -760,10 +808,17 @@ func (p *protocolV2) CLS(client *clientV2, params [][]byte) ([]byte, error) {
 	return []byte("CLOSE_WAIT"), nil
 }
 
+//note: 客户端空闲时即没有其他消息需要发送给nsqd时，为了避免被判断为掉线，发送该消息给nsqd作为心跳回应
 func (p *protocolV2) NOP(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, nil
 }
 
+//note: 从tcp获取到来自客户端到发布消息，
+// 调用topic.PutMessage，传入Topic.memoryMsgChan
+//	Topic.messagePump 中便利旗下所有Channel，拷贝消息，然后调用 Channel.PutMessage
+//	Channel.PutMessage 会将消息放入 Channel.memoryMsgChan 中
+//	在protocolV2.messagePump 函数中获取该消息并且真正发送给客户端
+//	注意：这里 Channel.memoryMsgChan 的监听者（协程）就是该通道下的所有订阅者（协程），这里实现了消息分发，一个消息随机到某个监听者
 func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 	var err error
 
@@ -814,6 +869,7 @@ func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 	return okBytes, nil
 }
 
+//note: 相较于PUB一次发送一个消息，MPUB一次发送多个消息
 func (p *protocolV2) MPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	var err error
 
@@ -867,6 +923,7 @@ func (p *protocolV2) MPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	return okBytes, nil
 }
 
+//note: 相较于PUB一次发送一个即时消息，DPUB一次发送一个延时消息
 func (p *protocolV2) DPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	var err error
 
@@ -931,6 +988,7 @@ func (p *protocolV2) DPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	return okBytes, nil
 }
 
+//note: 当订阅者使用异步方式处理消息时，不希望该消息在nsqd超时时可以发送TOUCH消息来延迟时间，防止超时，更多见Channel.TouchMessage注释
 func (p *protocolV2) TOUCH(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
 	if state != stateSubscribed && state != stateClosing {

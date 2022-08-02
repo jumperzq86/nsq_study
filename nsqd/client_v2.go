@@ -121,6 +121,9 @@ func (s ClientV2Stats) String() string {
 }
 
 type clientV2 struct {
+	//question: 一个客户端能够订阅多个主题吗？能够的话，就应该关联到多个 nsqd，因为可能订阅的多个主题位于多个nsqd上
+	//	是否这里的 clientV2 只表示一个客户端与一个nsqd的连接，所以这里只关联到一个nsqd
+
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	ReadyCount    int64
 	InFlightCount int64
@@ -227,6 +230,7 @@ func (c *clientV2) String() string {
 	return c.RemoteAddr().String()
 }
 
+//note: clientV2 可能代表消费者，也可能代表生产者
 func (c *clientV2) Type() int {
 	c.metaLock.RLock()
 	hasPublished := len(c.pubCounts) > 0

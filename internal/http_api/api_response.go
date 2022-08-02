@@ -104,6 +104,8 @@ func RespondV1(w http.ResponseWriter, code int, data interface{}) {
 	w.Write(response)
 }
 
+//note: 采用装饰器模式，将逻辑函数外层包装上功能函数，比如日志打印，数据回复
+//exercise: 装饰器模式 - 函数式编程
 func Decorate(f APIHandler, ds ...Decorator) httprouter.Handle {
 	decorated := f
 	for _, decorate := range ds {

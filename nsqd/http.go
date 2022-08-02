@@ -38,6 +38,8 @@ type httpServer struct {
 	router      http.Handler
 }
 
+//note: 通过http接口提供一些功能接口，在nsqadmin可以通过后台页面来进行一些管理操作
+//	在 httpServer 中包含 nsqd实例，由此进行所有的逻辑操作
 func newHTTPServer(nsqd *NSQD, tlsEnabled bool, tlsRequired bool) *httpServer {
 	log := http_api.Log(nsqd.logf)
 

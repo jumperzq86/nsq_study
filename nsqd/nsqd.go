@@ -48,6 +48,7 @@ type NSQD struct {
 
 	opts atomic.Value
 
+	//note: 用于锁数据目录的目录锁，非同步锁
 	dl        *dirlock.DirLock
 	isLoading int32
 	isExiting int32
@@ -250,15 +251,18 @@ func (n *NSQD) Main() error {
 		})
 	}
 
+	//note: 启动tcp server
 	n.waitGroup.Wrap(func() {
 		exitFunc(protocol.TCPServer(n.tcpListener, n.tcpServer, n.logf))
 	})
+	//note: 启动 http server
 	if n.httpListener != nil {
 		httpServer := newHTTPServer(n, false, n.getOpts().TLSRequired == TLSRequired)
 		n.waitGroup.Wrap(func() {
 			exitFunc(http_api.Serve(n.httpListener, httpServer, "HTTP", n.logf))
 		})
 	}
+	//note: 启动 https server
 	if n.httpsListener != nil {
 		httpsServer := newHTTPServer(n, true, true)
 		n.waitGroup.Wrap(func() {
@@ -269,6 +273,7 @@ func (n *NSQD) Main() error {
 	n.waitGroup.Wrap(n.queueScanLoop)
 	n.waitGroup.Wrap(n.lookupLoop)
 	if n.getOpts().StatsdAddress != "" {
+		//question: statsdLoop 是干啥的，看样子与统计有关
 		n.waitGroup.Wrap(n.statsdLoop)
 	}
 
@@ -315,6 +320,7 @@ func writeSyncFile(fn string, data []byte) error {
 	return err
 }
 
+//note: 读取配置文件，依次 创建topic及其channel之后，启动topic
 func (n *NSQD) LoadMetadata() error {
 	atomic.StoreInt32(&n.isLoading, 1)
 	defer atomic.StoreInt32(&n.isLoading, 0)
@@ -359,6 +365,11 @@ func (n *NSQD) LoadMetadata() error {
 	return nil
 }
 
+//note: 写入配置文件，配置文件中包含 所有topic名字/pause及其下channel名字/pause
+//	在几种情况下会调用
+//	nsqd 退出时
+// 	创建/删除/暂停 topic 时
+// 	创建/删除/暂停 channel 时
 func (n *NSQD) PersistMetadata() error {
 	// persist metadata about what topics/channels we have, across restarts
 	fileName := newMetadataFile(n.getOpts())
@@ -491,6 +502,8 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 
 	// if using lookupd, make a blocking call to get channels and immediately create them
 	// to ensure that all channels receive published messages
+	//question: 为何这里获取topic时，要从nsqlookupd 上面去获取channel信息
+	//	是否因为流程上可以先创建channel，在创建topic?
 	lookupdHTTPAddrs := n.lookupdHTTPAddrs()
 	if len(lookupdHTTPAddrs) > 0 {
 		channelNames, err := n.ci.GetLookupdTopicChannels(t.name, lookupdHTTPAddrs)
@@ -559,6 +572,7 @@ func (n *NSQD) Notify(v interface{}, persist bool) {
 		select {
 		case <-n.exitChan:
 		case n.notifyChan <- v:
+			//note: 临时topic/channel无需串行化
 			if loading || !persist {
 				return
 			}
@@ -598,15 +612,18 @@ func (n *NSQD) resizePool(num int, workCh chan *Channel, responseCh chan bool, c
 	} else if idealPoolSize > n.getOpts().QueueScanWorkerPoolMax {
 		idealPoolSize = n.getOpts().QueueScanWorkerPoolMax
 	}
+	//todo: 研究提炼此处所使用的协程池逻辑
 	for {
 		if idealPoolSize == n.poolSize {
 			break
 		} else if idealPoolSize < n.poolSize {
+			//note: 每次关闭一个协程，不停的关闭直到 idealPoolSize == n.poolSize
 			// contract
 			closeCh <- 1
 			n.poolSize--
 		} else {
 			// expand
+			//note: 这里创建协程执行 queueScanWorker 目的在于周期扫描 channel 中超时的inflight/deferred消息，将他们重新放回内存队列
 			n.waitGroup.Wrap(func() {
 				n.queueScanWorker(workCh, responseCh, closeCh)
 			})
@@ -649,6 +666,8 @@ func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, close
 //
 // If QueueScanDirtyPercent (default: 25%) of the selected channels were dirty,
 // the loop continues without sleep.
+
+//note: queueScanLoop 目的在于周期扫描 nsqd下所有topic下所有 channel 中超时的inflight/deferred消息，将他们重新放回内存队列
 func (n *NSQD) queueScanLoop() {
 	workCh := make(chan *Channel, n.getOpts().QueueScanSelectionCount)
 	responseCh := make(chan bool, n.getOpts().QueueScanSelectionCount)
@@ -679,7 +698,16 @@ func (n *NSQD) queueScanLoop() {
 			num = len(channels)
 		}
 
+		//note:
+		//	每次检测channel的数量为num（QueueScanSelectionCount 和 channel总数的最小值）
+		//	若是一个channel中存在超时的 inflight msg / deferred msg 那么就视为dirty
+		//	若是dirty的channel数量与总检测数量num 比值 > QueueScanDirtyPercent 就说明超时的还比较多
+		//	此时会再次进行一次检测，直到上述比值 <= QueueScanDirtyPercent
+		//	这里检测协程是在resizePool中创建的，其数量是动态变化的，满足 1 <= pool <= min(num * 0.25, QueueScanWorkerPoolMax)
+		//	也就是大概每个协程平均处理4个channel的操作
 	loop:
+
+		//note: 从所有channel中随机选取num个进行检测
 		for _, i := range util.UniqRands(num, len(channels)) {
 			workCh <- channels[i]
 		}
