@@ -12,6 +12,9 @@ import (
 	"github.com/nsqio/nsq/internal/version"
 )
 
+//note: 构造回调函数，在Commond中判断之前未连接时调用
+//	该函数中发送 identify 消息进行识别
+//	识别成功之后，遍历所有 topic/channel 构造 register消息，发送到nsqlookupd
 func connectCallback(n *NSQD, hostname string) func(*lookupPeer) {
 	return func(lp *lookupPeer) {
 		ci := make(map[string]interface{})

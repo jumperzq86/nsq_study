@@ -34,6 +34,7 @@ func newHTTPServer(l *NSQLookupd) *httpServer {
 	router.Handle("GET", "/info", http_api.Decorate(s.doInfo, log, http_api.V1))
 
 	// v1 negotiate
+	//note: 如下命令可以用于 nsqadmin / 消费者客户端 进行查询
 	router.Handle("GET", "/debug", http_api.Decorate(s.doDebug, log, http_api.V1))
 	router.Handle("GET", "/lookup", http_api.Decorate(s.doLookup, log, http_api.V1))
 	router.Handle("GET", "/topics", http_api.Decorate(s.doTopics, log, http_api.V1))
@@ -41,6 +42,7 @@ func newHTTPServer(l *NSQLookupd) *httpServer {
 	router.Handle("GET", "/nodes", http_api.Decorate(s.doNodes, log, http_api.V1))
 
 	// only v1
+	//note: 如下命令应该是从后台即 nsqadmin 过来的操作命令
 	router.Handle("POST", "/topic/create", http_api.Decorate(s.doCreateTopic, log, http_api.V1))
 	router.Handle("POST", "/topic/delete", http_api.Decorate(s.doDeleteTopic, log, http_api.V1))
 	router.Handle("POST", "/channel/create", http_api.Decorate(s.doCreateChannel, log, http_api.V1))

@@ -89,7 +89,7 @@ func decodeMessage(b []byte) (*Message, error) {
 	return &msg, nil
 }
 
-//exercise: sync.Pool / bytes.Buffer / binary.BigEndian / []byte
+//exercise ok: sync.Pool / bytes.Buffer / binary.BigEndian / []byte
 func writeMessageToBackend(msg *Message, bq BackendQueue) error {
 	//note: 将Message 转换为[]byte，这里使用 bytes.Buffer，性能考虑，使用 sync.Pool
 	buf := bufferPoolGet()

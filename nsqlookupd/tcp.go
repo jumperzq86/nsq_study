@@ -13,6 +13,7 @@ type tcpServer struct {
 	conns      sync.Map
 }
 
+//note: 接收到来自nsqd的连接之后，创建协程，调用 Handle，启动阻塞函数 IOLoop来处理所有消息逻辑
 func (p *tcpServer) Handle(conn net.Conn) {
 	p.nsqlookupd.logf(LOG_INFO, "TCP: new client(%s)", conn.RemoteAddr())
 

@@ -12,6 +12,8 @@ type RegistrationDB struct {
 	registrationMap map[Registration]ProducerMap
 }
 
+//note: 内存中存放三种category : client / topic / channel
+//	这里可以看到这些信息都是存放到内存中的，因此也是不具有安全性的
 type Registration struct {
 	Category string
 	Key      string

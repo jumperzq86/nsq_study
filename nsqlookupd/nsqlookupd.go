@@ -63,9 +63,12 @@ func (l *NSQLookupd) Main() error {
 		})
 	}
 
+	//note: 启动tcp server 接收来自nsqd的连接
 	l.waitGroup.Wrap(func() {
 		exitFunc(protocol.TCPServer(l.tcpListener, l.tcpServer, l.logf))
 	})
+
+	//note: 启动http server 接收来自nsqadmin的请求
 	httpServer := newHTTPServer(l)
 	l.waitGroup.Wrap(func() {
 		exitFunc(http_api.Serve(l.httpListener, httpServer, "HTTP", l.logf))

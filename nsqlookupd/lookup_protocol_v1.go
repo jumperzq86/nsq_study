@@ -25,6 +25,7 @@ func (p *LookupProtocolV1) NewClient(conn net.Conn) protocol.Client {
 	return NewClientV1(conn)
 }
 
+//note: 每个nsqd连接，对应一个独立协程中的IOLoop进行逻辑处理
 func (p *LookupProtocolV1) IOLoop(c protocol.Client) error {
 	var err error
 	var line string
@@ -86,6 +87,7 @@ func (p *LookupProtocolV1) IOLoop(c protocol.Client) error {
 	return err
 }
 
+//note: Exec处理来自nsqd的消息，注册/注销消息的流程是 客户端 ->  nsqd -> nsqdlookup
 func (p *LookupProtocolV1) Exec(client *ClientV1, reader *bufio.Reader, params []string) ([]byte, error) {
 	switch params[0] {
 	case "PING":
@@ -122,6 +124,9 @@ func getTopicChan(command string, params []string) (string, string, error) {
 	return topicName, channelName, nil
 }
 
+//note: 生产者告知nsqd创建 topic &/ channel ， nsqd 通知nsqlookupd 创建 topic &/ channel，存于db
+//	因为在消费者连接nsqlookupd时需要查询自己感兴趣到topic / channel 在哪些nsqd
+//	由Registration结构来看，不同nsqd可以具有相同topic，还可以具有相同topic-channel
 func (p *LookupProtocolV1) REGISTER(client *ClientV1, reader *bufio.Reader, params []string) ([]byte, error) {
 	if client.peerInfo == nil {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "client must IDENTIFY")
@@ -197,6 +202,8 @@ func (p *LookupProtocolV1) UNREGISTER(client *ClientV1, reader *bufio.Reader, pa
 	return []byte("OK"), nil
 }
 
+//note: 接收来自nsqd的第一条信息，其中包含了nsqd的基础信息，将其解码到peerInfo，存于 client & db 中，register/unregister会使用
+//	最后回复nsqd 当前nsqlookup的基础信息
 func (p *LookupProtocolV1) IDENTIFY(client *ClientV1, reader *bufio.Reader, params []string) ([]byte, error) {
 	var err error
 
@@ -235,6 +242,7 @@ func (p *LookupProtocolV1) IDENTIFY(client *ClientV1, reader *bufio.Reader, para
 	p.nsqlookupd.logf(LOG_INFO, "CLIENT(%s): IDENTIFY Address:%s TCP:%d HTTP:%d Version:%s",
 		client, peerInfo.BroadcastAddress, peerInfo.TCPPort, peerInfo.HTTPPort, peerInfo.Version)
 
+	//note: 将client信息 peerInfo 存放到db中
 	client.peerInfo = &peerInfo
 	if p.nsqlookupd.DB.AddProducer(Registration{"client", "", ""}, &Producer{peerInfo: client.peerInfo}) {
 		p.nsqlookupd.logf(LOG_INFO, "DB: client(%s) REGISTER category:%s key:%s subkey:%s", client, "client", "", "")
